@@ -364,6 +364,21 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
+  // ---- standing instruction: remind the model to use the tool at milestones.
+  //      (Freshness does NOT depend on this — the turn_end hook below
+  //      auto-maintains the file; this only improves SEMANTIC quality.) ----
+  pi.on("before_agent_start", (event) => {
+    try {
+      if (event.systemPrompt && !event.systemPrompt.includes("[checkpoint-compaction]")) {
+        return {
+          systemPrompt:
+            event.systemPrompt +
+            "\n\n[checkpoint-compaction] At milestones (starting a task, significant progress, decisions, error resolutions, before risky work), call checkpoint_update with the full session state (sections: GOAL, DONE, DECISIONS, NEXT, STATE). Between milestones you may skip it: the harness rewrites the checkpoint file after every turn automatically, and compaction is mechanical (zero LLM calls) either way.",
+        };
+      }
+    } catch { /* non-fatal */ }
+  });
+
   // ---- turn-end auto-maintenance: harness keeps the checkpoint fresh even
   //      if the model never calls checkpoint_update ----
   let lastUserPrompt = "";

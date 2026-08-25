@@ -78,6 +78,12 @@ the recent turns, and mid-turn compaction digests the turn prefix
 mechanically, so turn granularity is exactly as fresh as compaction ever
 needs — at a fraction of the file churn.
 
+Finally, the extension appends a one-paragraph standing instruction to the
+system prompt each run (via `before_agent_start`) reminding the model to call
+`checkpoint_update` at milestones — so the *semantic* quality of the file
+tracks what the model is actually thinking, even though freshness no longer
+depends on it.
+
 ## Development
 
 The extension is a single file (`extensions/checkpoint-compaction.ts`) with no
