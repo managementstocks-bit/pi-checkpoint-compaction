@@ -1,0 +1,37 @@
+{
+  "name": "pi-checkpoint-compaction",
+  "version": "0.1.0",
+  "description": "Zero-LLM compaction for pi: a model-maintained checkpoint file folded into context at compaction time, with a mechanical span digest as fallback. LLM summarization only as last resort.",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "compaction",
+    "context-window",
+    "checkpoint",
+    "llm-agent"
+  ],
+  "type": "module",
+  "license": "MIT",
+  "author": "imboss",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/managementstocks-bit/pi-checkpoint-compaction.git"
+  },
+  "homepage": "https://github.com/managementstocks-bit/pi-checkpoint-compaction#readme",
+  "bugs": {
+    "url": "https://github.com/managementstocks-bit/pi-checkpoint-compaction/issues"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
