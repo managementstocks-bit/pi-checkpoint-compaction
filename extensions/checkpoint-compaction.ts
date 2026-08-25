@@ -23,9 +23,21 @@
  * role-matching bug is fixed there too).
  *
  * Deliberate deviations: customInstructions (user asked /compact for a focused
- * LLM summary) and split-turn cuts defer to pi's default summarizer; read/
- * modified file lists are included in summary text + details so pi's
- * cumulative file tracking keeps working.
+ * LLM summary) still defer to pi's default summarizer; split-turn cuts are
+ * handled mechanically (span digest/fold + mechanical digest of the retained
+ * turn's prefix — pi's default would spend two LLM calls there); read/modified
+ * file lists are included in summary text + details so pi's cumulative file
+ * tracking keeps working.
+ *
+ * Auto-maintenance (turn_end hook): the harness rewrites the checkpoint file
+ * after EVERY turn with (a) the model's last semantic checkpoint carried
+ * forward verbatim and (b) a fresh "Recent activity" section (last user
+ * prompt, assistant text, tool calls, tool errors of the just-ended turn).
+ * If the model called checkpoint_update during the turn, the harness skips —
+ * the model's word wins. This guarantees the file is fresh at every
+ * compaction boundary even if the model never calls the tool at all; the
+ * tool then exists to add SEMANTIC state (goals, decisions), not to keep the
+ * file fresh.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -117,7 +129,16 @@ const textOf = (content: unknown): string => {
  * "toolResult" with isError; previous summaries are role "compactionSummary"
  * — both handled explicitly (no role-matching gaps).
  */
-export function mechanicalDigest(messages: AnyMessage[], anchor: CheckpointRef | null): string | null {
+const DIGEST_HEADERS = {
+  span: "# Span digest (harness-recorded, no LLM)",
+  prefix: "# Turn prefix digest (harness-recorded, no LLM)",
+} as const;
+
+export function mechanicalDigest(
+  messages: AnyMessage[],
+  anchor: CheckpointRef | null,
+  kind: keyof typeof DIGEST_HEADERS = "span",
+): string | null {
   if (!Array.isArray(messages) || messages.length === 0) return null;
   const lines: string[] = [];
   let users = 0;
@@ -182,7 +203,7 @@ export function mechanicalDigest(messages: AnyMessage[], anchor: CheckpointRef |
     kept.unshift(lines[i]);
     used += cost;
   }
-  const header = `# Span digest (harness-recorded, no LLM)\n${users} user request(s), ${steps} assistant step(s), ${tools} tool call(s) in the folded span:\n`;
+  const header = `${DIGEST_HEADERS[kind]}\n${users} user request(s), ${steps} assistant step(s), ${tools} tool call(s) in the folded span:\n`;
   const elided = kept.length < lines.length ? "(earlier activity elided — full detail stays in the durable log)\n" : "";
   return header + elided + (anchorText ? anchorText + "\n\n" : "") + kept.join("\n");
 }
@@ -213,6 +234,12 @@ function fileBlocks(files: { readFiles: string[]; modifiedFiles: string[] }): st
   if (files.readFiles.length > 0) sections.push(`<read-files>\n${files.readFiles.join("\n")}\n</read-files>`);
   if (files.modifiedFiles.length > 0) sections.push(`<modified-files>\n${files.modifiedFiles.join("\n")}\n</modified-files>`);
   return sections.length ? `\n\n${sections.join("\n\n")}` : "";
+}
+
+/** Extract a "## NAME" section (up to the next "## ") from markdown text. */
+function extractSection(text: string, name: string): string {
+  const m = text.match(new RegExp(`^## ${name}[\\s\\S]*?(?=^## |(?![\\s\\S]))`, "m"));
+  return m ? m.map((s) => s.trim()).join("\n").trim() : "";
 }
 
 function foldSummary(cp: CheckpointRef, files: { readFiles: string[]; modifiedFiles: string[] }): string {
@@ -268,8 +295,8 @@ export default function (pi: ExtensionAPI) {
     try {
       const { preparation } = event;
       const messages = preparation.messagesToSummarize as unknown as AnyMessage[];
+      const prefix = preparation.turnPrefixMessages as unknown as AnyMessage[] | undefined;
       if (!Array.isArray(messages) || messages.length === 0) return; // nothing to fold → default
-      if (preparation.isSplitTurn) return; // rare mid-turn cut → default LLM
       if (event.customInstructions) return; // user asked for a focused LLM summary → default
 
       let sessionId: string | null = null;
@@ -293,12 +320,21 @@ export default function (pi: ExtensionAPI) {
 
       const files = fileLists(preparation.fileOps as FileOpsLike);
 
+      // Split turns: the kept region starts mid-turn; pi's default would spend
+      // two LLM calls (span + turn prefix). Digest the prefix mechanically,
+      // merged in pi's own format so the model sees a familiar shape.
+      let prefixBlock = "";
+      if (preparation.isSplitTurn && Array.isArray(prefix) && prefix.length > 0) {
+        const pd = mechanicalDigest(prefix, null, "prefix");
+        if (pd) prefixBlock = `\n\n---\n\n**Turn Context (split turn):**\n\n${pd}`;
+      }
+
       // TIER 1: fresh checkpoint → fold it, no LLM call.
       const fresh = await readCheckpoint(sessionId, boundaryMs);
       if (fresh) {
         return {
           compaction: {
-            summary: foldSummary(fresh, files),
+            summary: foldSummary(fresh, files) + prefixBlock,
             firstKeptEntryId: preparation.firstKeptEntryId,
             tokensBefore: preparation.tokensBefore,
             details: files,
@@ -312,7 +348,7 @@ export default function (pi: ExtensionAPI) {
       if (digest) {
         return {
           compaction: {
-            summary: digest + fileBlocks(files),
+            summary: digest + fileBlocks(files) + prefixBlock,
             firstKeptEntryId: preparation.firstKeptEntryId,
             tokensBefore: preparation.tokensBefore,
             details: files,
@@ -325,6 +361,85 @@ export default function (pi: ExtensionAPI) {
     } catch (err) {
       console.error(`[checkpoint-compaction] handler error, defaulting to LLM summarizer: ${String((err as Error)?.message || err)}`);
       return;
+    }
+  });
+
+  // ---- turn-end auto-maintenance: harness keeps the checkpoint fresh even
+  //      if the model never calls checkpoint_update ----
+  let lastUserPrompt = "";
+  let turnStartTs = 0;
+  let lastHarnessWriteMs = 0; // in-memory: distinguishes harness writes from model writes
+  pi.on("message_start", (event) => {
+    try {
+      const m = event.message as AnyMessage | undefined;
+      if (m?.role === "user") {
+        const t = textOf(m.content);
+        if (t && !t.trim().startsWith("<system-reminder>") && !t.startsWith("Current runtime context")) lastUserPrompt = t;
+      }
+    } catch { /* non-fatal */ }
+  });
+  pi.on("turn_start", (event) => {
+    turnStartTs = typeof event.timestamp === "number" ? event.timestamp : Date.now();
+  });
+  pi.on("turn_end", async (event, ctx) => {
+    try {
+      let sessionId: string | null = null;
+      try {
+        sessionId = ctx.sessionManager.getSessionId();
+      } catch { /* ephemeral */ }
+      const dir = checkpointDir();
+      const file = sessionId ? join(dir, sessionId + ".md") : join(dir, "active.md");
+
+      // Model updated the checkpoint during this turn → its word wins. (The
+      // harness only writes at turn_end, i.e. after turnStart, and never
+      // postdates its own last write; a strictly-newer mtime within this turn
+      // can only be the model's. Even a boundary race only costs a
+      // reformat: the carry-forward below preserves the model's text.)
+      let mtime = -1;
+      try {
+        mtime = (await stat(file)).mtimeMs;
+      } catch { /* no file yet */ }
+      if (mtime > lastHarnessWriteMs && mtime > turnStartTs) return;
+
+      // Carry forward the model's semantic text (strip our prior activity
+      // section so it doesn't accumulate).
+      let prior = "";
+      try {
+        prior = (await readFile(file, "utf8")).trim();
+      } catch { /* first turn */ }
+      const priorModel = prior.replace(/\n+## Recent activity \[.*$/s, "").trim();
+
+      const lines: string[] = [];
+      if (lastUserPrompt) lines.push(`[USER] ${clip(lastUserPrompt, 400)}`);
+      const msg = (event as { message?: AnyMessage }).message;
+      if (msg) {
+        const t = textOf(msg.content);
+        if (t) lines.push(`[ASSISTANT] ${clip(t, 320)}`);
+        for (const b of Array.isArray(msg.content) ? msg.content : []) {
+          if (b && typeof b === "object" && (b as { type?: string }).type === "toolCall") {
+            lines.push(`[TOOL] ${String((b as { name?: string }).name || "?")}`);
+          }
+        }
+      }
+      for (const tr of ((event as { toolResults?: AnyMessage[] }).toolResults || [])) {
+        const t = textOf(tr?.content);
+        if (tr?.isError === true || (t && /^Error:/i.test(t))) lines.push(`[TOOL-ERROR] ${clip(t, 160)}`);
+      }
+      const activity = lines.join("\n").slice(-1500);
+      if (!priorModel && !activity) return; // nothing worth recording
+
+      const goal = extractSection(priorModel, "GOAL") || lastUserPrompt;
+      const body = [
+        priorModel ? priorModel.slice(0, 4000) : goal ? `## GOAL\n${goal.slice(0, 400)}` : "",
+        activity ? `## Recent activity [harness-recorded, turn ${event.turnIndex}, ${new Date().toISOString()}]\n${activity}` : "",
+      ]
+        .filter(Boolean)
+        .join("\n\n");
+      await mkdir(dir, { recursive: true });
+      await writeFile(file, body.slice(0, MAX_CHECKPOINT_CHARS) + "\n", "utf8");
+      lastHarnessWriteMs = Date.now();
+    } catch (err) {
+      console.error(`[checkpoint-compaction] turn_end maintenance failed: ${String((err as Error)?.message || err)}`);
     }
   });
 

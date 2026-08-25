@@ -1,6 +1,6 @@
 {
   "name": "pi-checkpoint-compaction",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Zero-LLM compaction for pi: a model-maintained checkpoint file folded into context at compaction time, with a mechanical span digest as fallback. LLM summarization only as last resort.",
   "keywords": [
     "pi-package",

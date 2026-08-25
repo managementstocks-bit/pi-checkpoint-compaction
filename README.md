@@ -41,11 +41,13 @@ hook applies a 3-tier policy:
 |------|-----------|--------------|------|
 | 1 | checkpoint newer than the span (60 s epsilon) | checkpoint text folded in as the new summary | no |
 | 2 | checkpoint exists but older than the span (max 12 h) | mechanical digest of the span (user asks, assistant decisions, tool calls, `[TOOL-ERROR]` lines) with the checkpoint as goal anchor | no |
-| 3 | no usable checkpoint, empty span, custom compaction instructions, or split turn | defer to pi's default LLM compaction | yes |
+| 3 | no usable checkpoint and nothing digestible in the span, or custom compaction instructions | defer to pi's default LLM compaction | yes |
 
-Split turns are deliberately deferred to pi's built-in summarizer because
-pi preserves the partial-turn prefix in that path, which an extension summary
-cannot.
+Split turns (pi cutting mid-turn, keeping a turn prefix) are handled
+mechanically too: the span digest/checkpoint fold is merged with a mechanical
+digest of the turn prefix, in pi's own `**Turn Context (split turn):**` format.
+That path is where pi's default summarizer spends two LLM calls — here it
+spends zero.
 
 The checkpoint file is per-session (`<sessionId>.md`); a shared `active.md`
 is only read as a fallback anchor and is never overwritten when a session ID
@@ -58,9 +60,23 @@ Tell the agent once:
 > After every meaningful milestone, call `checkpoint_update` with the current
 > goal, what is done, and what is next.
 
-The agent maintains the file as it works; compaction then costs zero LLM
-tokens as long as the checkpoint is fresh. If the agent forgets, compaction
-still produces a faithful skeleton of the span (tier 2) rather than guessing.
+### You don't even need to trust the agent
+
+A `turn_end` hook rewrites the checkpoint file after **every turn**: it
+preserves the model's last semantic checkpoint verbatim and appends a fresh
+"Recent activity" section (last user prompt, assistant text, tool calls, tool
+errors of the turn that just ended). If the model called `checkpoint_update`
+during the turn, the harness skips — the model's word wins.
+
+So the file is fresh at every compaction boundary even if the model never
+calls the tool at all; the tool then exists to add *semantic* state (goals,
+decisions, plans), not to keep the file fresh. Compaction costs zero LLM
+tokens in either case.
+
+Per-tool-call updates are deliberately not done: pi's compaction always keeps
+the recent turns, and mid-turn compaction digests the turn prefix
+mechanically, so turn granularity is exactly as fresh as compaction ever
+needs — at a fraction of the file churn.
 
 ## Development
 
