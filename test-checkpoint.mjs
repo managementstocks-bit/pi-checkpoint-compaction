@@ -233,18 +233,27 @@ import("node:fs").then(async (fs) => {
   check("auto: GOAL falls back to last user prompt", autoText.includes("## GOAL\nFresh session task"));
   check("auto: records assistant text", autoText.includes("[ASSISTANT] ok"));
 
-  // model writes during turn 2 → harness must NOT overwrite
+  // model writes during turn 2 → harness must NOT overwrite.
+  // Turn timestamps are explicit and far apart (2 s / 10 s) and the model
+  // write's mtime is pinned to T2+2 s, so the handler's mtime-vs-turnStart
+  // comparison is deterministic even on filesystems that quantize mtime to
+  // whole seconds.
+  const T2 = Date.now();
   handlers.message_start({ message: { role: "user", content: "Next: docs" } });
-  handlers.turn_start({ turnIndex: 2, timestamp: Date.now() });
+  handlers.turn_start({ turnIndex: 2, timestamp: T2 });
   await new Promise((r) => setTimeout(r, 10));
   fs.writeFileSync(autoFile, "## GOAL\nsemantic goal from model\n## DONE\nmodel work\n");
+  fs.utimesSync(autoFile, (T2 + 2000) / 1000, (T2 + 2000) / 1000);
   await handlers.turn_end({ turnIndex: 2, message: { role: "assistant", content: [{ type: "text", text: "Docs updated." }] }, toolResults: [] }, autoCtx);
   autoText = fs.readFileSync(autoFile, "utf8");
   check("auto: model checkpoint not overwritten mid-turn", autoText.includes("semantic goal from model") && !autoText.includes("Docs updated"));
 
-  // turn 3: model silent → harness carries model text forward + appends fresh activity (fast turns, <60s apart)
+  // turn 3: model silent → harness carries model text forward + appends fresh
+  // activity. T3 is 10 s after T2 (well past the pinned T2+2 s mtime, so the
+  // model-write skip cannot misfire).
+  const T3 = T2 + 10000;
   handlers.message_start({ message: { role: "user", content: "Now add tests" } });
-  handlers.turn_start({ turnIndex: 3, timestamp: Date.now() });
+  handlers.turn_start({ turnIndex: 3, timestamp: T3 });
   await handlers.turn_end({
     turnIndex: 3,
     message: { role: "assistant", content: [{ type: "text", text: "Adding tests." }, { type: "toolCall", name: "write", arguments: { path: "x.test.ts" } }] },
