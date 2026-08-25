@@ -87,8 +87,30 @@ depends on it.
 ## Development
 
 The extension is a single file (`extensions/checkpoint-compaction.ts`) with no
-runtime dependencies beyond what pi bundles (`typebox`, the pi core). Unit
-tests live in the repository root (`test-checkpoint.mjs`).
+runtime dependencies beyond what pi bundles (`typebox`, the pi core).
+
+### Tests
+
+`test-checkpoint.mjs` at the repository root is a self-contained suite — no
+test framework, no network, runs against a temp directory. 46 checks covering:
+
+- registration of the `checkpoint_update` tool, `/checkpoint` command, and
+  the compaction / `turn_end` / `before_agent_start` hooks
+- checkpoint file lifecycle: per-session writes, 12 h staleness cap
+- Tier 1: fresh checkpoint folded in verbatim, zero LLM
+- Tier 2: stale checkpoint → mechanical span digest (user asks, assistant
+  steps, `[TOOL-ERROR]` lines) with the checkpoint as goal anchor
+- Tier 3: no usable checkpoint and nothing digestible → defers to pi's
+  default LLM compaction; custom compaction instructions always defer
+- split turns: turn prefix digested in pi's `**Turn Context (split turn):**`
+  format and merged with the span digest
+- `turn_end` auto-maintenance: "Recent activity" appended every turn, the
+  model's last semantic block preserved verbatim, 60 s freshness epsilon
+- system-prompt standing-instruction injection via `before_agent_start`
+
+```bash
+npm test            # or: node test-checkpoint.mjs
+```
 
 ## License
 

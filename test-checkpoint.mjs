@@ -1,19 +1,13 @@
-// Unit test for extensions/checkpoint-compaction.ts
+// Unit test for ~/.pi/agent/extensions/checkpoint-compaction.ts
 import { createRequire } from "node:module";
-import { execSync } from "node:child_process";
 const nodeRequire = createRequire(import.meta.url);
 // pi loads extensions with jiti/static based on its own dist loader.js, so
 // bare specifiers (typebox, @earendil-works/pi-coding-agent) resolve from pi's
-// node_modules. Mirror that exactly by reusing pi's own jiti build.
-const piRoot = `${execSync("npm prefix -g").toString().trim()}/lib/node_modules/@earendil-works/pi-coding-agent`;
-const { createJiti } = nodeRequire(piRoot + "/node_modules/jiti/lib/jiti.cjs");
+// node_modules. Mirror that exactly.
+const { createJiti } = nodeRequire("/usr/local/lib/node_modules/@earendil-works/pi-coding-agent/node_modules/jiti/lib/jiti.cjs");
 import { mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
-
-const here = dirname(fileURLToPath(import.meta.url));
-const EXT = join(here, "extensions", "checkpoint-compaction.ts");
+import { join } from "node:path";
 
 const PI_ROOT = "/usr/local/lib/node_modules/@earendil-works/pi-coding-agent";
 // Mirror pi's production loader.js alias map (getAliases) for the bare
@@ -25,7 +19,7 @@ const alias = {
   "@earendil-works/pi-coding-agent": PI_ROOT + "/index.js",
 };
 const jiti = createJiti(PI_ROOT + "/dist/core/extensions/loader.js", { interopDefault: true, moduleCache: false, alias });
-const mod = jiti(EXT);
+const mod = jiti("/root/.pi/agent/extensions/checkpoint-compaction.ts");
 const { mechanicalDigest, readCheckpoint, fileLists } = mod;
 
 let failed = 0;
@@ -159,9 +153,10 @@ import("node:fs").then(async (fs) => {
 
   // --- default export loads and registers without throwing (mock API) ---
   const calls = [];
+  const handlers = {};
   const mockApi = {
     registerTool: (t) => calls.push(["tool", t.name]),
-    on: (name, _h) => calls.push(["on", name]),
+    on: (name, h) => { handlers[name] = h; },
     registerCommand: (name) => calls.push(["cmd", name]),
     registerHook: () => {},
   };
@@ -169,10 +164,100 @@ import("node:fs").then(async (fs) => {
     mod.default(mockApi);
     check("default export registers tool+hook+command",
       calls.includes("tool") || JSON.stringify(calls).includes('"checkpoint_update"'));
+    check("hook handler registered", typeof handlers.session_before_compact === "function");
   } catch (e) {
     check("default export registers tool+hook+command", false);
     console.error(e);
   }
+
+  // --- hook-level: split-turn handling (no LLM) ---
+  const hook = handlers.session_before_compact;
+  const hookCtx = { sessionManager: { getSessionId: () => "hook-test-session" } };
+  const prefixMsgs = [
+    { role: "user", content: "Continue the login fix and deploy", timestamp: now - 100000 },
+    {
+      role: "assistant",
+      content: [{ type: "text", text: "Running the build." }, { type: "toolCall", name: "bash", arguments: { command: "npm run build" } }],
+      timestamp: now - 90000,
+    },
+  ];
+  const splitPrep = {
+    messagesToSummarize: messages,
+    turnPrefixMessages: prefixMsgs,
+    isSplitTurn: true,
+    firstKeptEntryId: "keep-1",
+    tokensBefore: 57000,
+    fileOps: { read: new Set(["a.ts"]), written: new Set(), edited: new Set() },
+  };
+  // no checkpoint file for hook-test-session yet → TIER 2
+  const rSplit = await hook({ preparation: splitPrep }, hookCtx);
+  check("split-turn: returns compaction (no LLM)", rSplit?.compaction?.firstKeptEntryId === "keep-1" && rSplit?.compaction?.tokensBefore === 57000);
+  check("split-turn: span digest header", rSplit?.compaction?.summary?.includes("# Span digest (harness-recorded, no LLM)"));
+  check("split-turn: prefix section in pi format", rSplit?.compaction?.summary?.includes("**Turn Context (split turn):**"));
+  check("split-turn: prefix digest header", rSplit?.compaction?.summary?.includes("# Turn prefix digest (harness-recorded, no LLM)"));
+  check("split-turn: prefix captures user request", rSplit?.compaction?.summary?.includes("[USER] Continue the login fix and deploy"));
+  check("split-turn: file ops in details", rSplit?.compaction?.details?.readFiles?.[0] === "a.ts");
+
+  // non-split: no prefix block
+  const rPlain = await hook({ preparation: { ...splitPrep, isSplitTurn: false, turnPrefixMessages: [] } }, hookCtx);
+  check("non-split: digest without prefix section", rPlain?.compaction?.summary?.includes("# Span digest") && !rPlain?.compaction?.summary?.includes("Turn Context (split turn)"));
+
+  // TIER 1 (fresh checkpoint) + split turn
+  const cpFile = join(homedir(), ".pi", "agent", "checkpoints", "hook-test-session.md");
+  fs.mkdirSync(join(homedir(), ".pi", "agent", "checkpoints"), { recursive: true });
+  fs.writeFileSync(cpFile, "GOAL: hook test state\nDONE: everything\n");
+  const rFold = await hook({ preparation: splitPrep }, hookCtx);
+  check("tier1+split: checkpoint fold + prefix", rFold?.compaction?.summary?.includes("# State restored from model checkpoint") && rFold?.compaction?.summary?.includes("GOAL: hook test state") && rFold?.compaction?.summary?.includes("**Turn Context (split turn):**"));
+  fs.rmSync(cpFile, { force: true });
+
+  // customInstructions → defer to pi's default LLM
+  const rCustom = await hook({ customInstructions: "focus on X", preparation: splitPrep }, hookCtx);
+  check("customInstructions → defer (undefined)", rCustom === undefined);
+
+  // --- before_agent_start: standing instruction appended to system prompt ---
+  const bas = handlers.before_agent_start({ systemPrompt: "You are a coding agent." });
+  check("sysprompt: checkpoint instruction appended", bas?.systemPrompt?.includes("[checkpoint-compaction]") && bas.systemPrompt.startsWith("You are a coding agent."));
+  const bas2 = handlers.before_agent_start({ systemPrompt: "You are a coding agent.\n\n[checkpoint-compaction] ..." });
+  check("sysprompt: not appended twice", bas2 === undefined);
+
+  // --- turn_end auto-maintenance (harness keeps checkpoint fresh) ---
+  const autoFile = join(homedir(), ".pi", "agent", "checkpoints", "auto-test-session.md");
+  fs.rmSync(autoFile, { force: true });
+  const autoCtx = { sessionManager: { getSessionId: () => "auto-test-session" } };
+
+  // first turn: no prior file → GOAL falls back to last user prompt
+  handlers.message_start({ message: { role: "user", content: "Fresh session task" } });
+  handlers.turn_start({ turnIndex: 1, timestamp: Date.now() });
+  await handlers.turn_end({ turnIndex: 1, message: { role: "assistant", content: [{ type: "text", text: "ok" }] }, toolResults: [] }, autoCtx);
+  let autoText = fs.readFileSync(autoFile, "utf8");
+  check("auto: GOAL falls back to last user prompt", autoText.includes("## GOAL\nFresh session task"));
+  check("auto: records assistant text", autoText.includes("[ASSISTANT] ok"));
+
+  // model writes during turn 2 → harness must NOT overwrite
+  handlers.message_start({ message: { role: "user", content: "Next: docs" } });
+  handlers.turn_start({ turnIndex: 2, timestamp: Date.now() });
+  await new Promise((r) => setTimeout(r, 10));
+  fs.writeFileSync(autoFile, "## GOAL\nsemantic goal from model\n## DONE\nmodel work\n");
+  await handlers.turn_end({ turnIndex: 2, message: { role: "assistant", content: [{ type: "text", text: "Docs updated." }] }, toolResults: [] }, autoCtx);
+  autoText = fs.readFileSync(autoFile, "utf8");
+  check("auto: model checkpoint not overwritten mid-turn", autoText.includes("semantic goal from model") && !autoText.includes("Docs updated"));
+
+  // turn 3: model silent → harness carries model text forward + appends fresh activity (fast turns, <60s apart)
+  handlers.message_start({ message: { role: "user", content: "Now add tests" } });
+  handlers.turn_start({ turnIndex: 3, timestamp: Date.now() });
+  await handlers.turn_end({
+    turnIndex: 3,
+    message: { role: "assistant", content: [{ type: "text", text: "Adding tests." }, { type: "toolCall", name: "write", arguments: { path: "x.test.ts" } }] },
+    toolResults: [{ role: "toolResult", content: [{ type: "text", text: "Error: test failed" }], isError: true }],
+  }, autoCtx);
+  autoText = fs.readFileSync(autoFile, "utf8");
+  check("auto: carries forward model GOAL", autoText.includes("## GOAL\nsemantic goal from model"));
+  check("auto: carries forward model DONE", autoText.includes("## DONE\nmodel work"));
+  check("auto: appends fresh activity w/ error", autoText.includes("[USER] Now add tests") && autoText.includes("[TOOL] write") && autoText.includes("[TOOL-ERROR] Error: test failed"));
+  check("auto: single activity section (no accumulation)", (autoText.match(/## Recent activity/g) || []).length === 1);
+  check("auto: file within cap", autoText.length <= 6000);
+  fs.rmSync(autoFile, { force: true });
+
   console.log(failed === 0 ? "\nALL TESTS PASSED" : `\n${failed} TEST(S) FAILED`);
   process.exit(failed === 0 ? 0 : 1);
 });
